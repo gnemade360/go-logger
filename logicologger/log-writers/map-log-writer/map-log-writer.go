@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
-	"time"
 )
 
 type MapLogWriter struct {
@@ -34,14 +33,11 @@ func (w *MapLogWriter) Write(p []byte) (int, error) {
 func (w *MapLogWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	start := time.Now()
 
 	if w.logs == nil {
 		return fmt.Errorf("logs map not setup with MapLogWriter")
 	}
 
-	elapsed := time.Since(start)
-	fmt.Printf("Elapsed time for writing logs: %v\n", elapsed)
 	return nil
 }
 

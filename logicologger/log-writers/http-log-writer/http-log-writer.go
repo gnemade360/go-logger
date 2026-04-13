@@ -24,6 +24,7 @@ type HTTPLogWriter struct {
 	Host         string
 	Port         int
 	HttpProtocol string
+	AuthToken    string
 	Client       *http.Client
 }
 
@@ -46,7 +47,9 @@ func (f *HTTPLogWriter) Write(p []byte) (n int, err error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	req.Header.Set("Authorization", "Token 5up3r-S3cr3t-auth-t0k3n")
+	if f.AuthToken != "" {
+		req.Header.Set("Authorization", f.AuthToken)
+	}
 
 	resp, err := f.Client.Do(req)
 	if err != nil {
@@ -99,13 +102,14 @@ func (f *HTTPLogWriter) Parse(event logicologger.LogEvent) logicologger.LogData 
 	return data
 }
 
-func NewHTTPLogWriter(protocol, host string, port int, endpoint, method string) *HTTPLogWriter {
+func NewHTTPLogWriter(protocol, host string, port int, endpoint, method, authToken string) *HTTPLogWriter {
 	return &HTTPLogWriter{
 		EndPoint:     endpoint,
 		Method:       method,
 		Host:         host,
 		Port:         port,
 		HttpProtocol: protocol,
+		AuthToken:    authToken,
 		Client:       &http.Client{},
 	}
 }

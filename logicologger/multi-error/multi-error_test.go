@@ -8,7 +8,7 @@ import (
 )
 
 func setupMultiError(errors ...error) *MultiError {
-	m := &MultiError{}
+	m := &MultiError{RWMutex: &sync.RWMutex{}}
 	for _, err := range errors {
 		m.Add(err)
 	}
@@ -78,7 +78,7 @@ func TestMultiError_ErrorOrNil(t *testing.T) {
 func TestMultiError_Concurrent(t *testing.T) {
 	const numErrors = 100
 
-	m := &MultiError{}
+	m := &MultiError{RWMutex: &sync.RWMutex{}}
 	var wg sync.WaitGroup
 
 	for i := 0; i < numErrors; i++ {
