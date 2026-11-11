@@ -3,7 +3,6 @@ package template_formatter
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"reflect"
 	"sync"
 	"text/template"
@@ -80,23 +79,23 @@ func (t TemplateFormatter) Format(event logicologger.LogEvent) ([]byte, error) {
 	_, err := tmpl.Parse(t.MessageTemplate)
 
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 
 	var doc bytes.Buffer
 	if errr := tmpl.Execute(&doc, event); errr != nil {
-		fmt.Printf("\nerr while tmpl-err: %v\n", errr)
+		return nil, errr
 	}
 
 	tmplMsg := template.New("loggerTemplateMessage")
 	if _, errWhileMsgTmpl := tmplMsg.Parse(doc.String()); errWhileMsgTmpl != nil {
-		fmt.Printf("\nerrWhileMsgTmpl while templating in logging-errWhileMsgTmpl: %v\n", errWhileMsgTmpl)
+		return nil, errWhileMsgTmpl
 	}
 
 	var docMsg bytes.Buffer
 	err = tmplMsg.Execute(&docMsg, event)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 	msg := docMsg.String()
 	byts := event.Bytes
@@ -105,8 +104,6 @@ func (t TemplateFormatter) Format(event logicologger.LogEvent) ([]byte, error) {
 		event.Bytes = []byte{}
 		if b, e := json.Marshal(event); e == nil {
 			byts = b
-		} else {
-			fmt.Printf("\nJSON marshal error-e: %v\n", e)
 		}
 
 	}

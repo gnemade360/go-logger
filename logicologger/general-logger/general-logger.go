@@ -15,11 +15,6 @@ import (
 	"time"
 )
 
-var (
-	singletonLogger logicologger.ParentLogger
-	once            sync.Once
-)
-
 type GeneralLogger struct {
 	writer logicologger.LogWriter
 	lvl    logicologger.LogLevel
@@ -38,7 +33,6 @@ type GeneralLogger struct {
 	OnLog           func(event logicologger.LogEvent)
 	indent          int
 	PrefixDelimiter string
-	once            sync.Once
 }
 
 func (g *GeneralLogger) AddChild(useThis logicologger.ParentLogger, prefix string, id string, data map[string]interface{}) logicologger.ParentLogger {
@@ -69,10 +63,9 @@ func (g *GeneralLogger) AddChild(useThis logicologger.ParentLogger, prefix strin
 		indent:              g.indent + 1,
 		id:                  childId,
 		OnLog: func(event logicologger.LogEvent) {
-			fmt.Printf("\nIn Child Log-event: %v\n", event)
 			g.write(event)
 		},
-		stopch: make(chan bool),
+		stopch: make(chan bool, 1),
 	}
 	g.children = append(g.children, useThis)
 	useThis.Start(context.Background())
@@ -102,6 +95,7 @@ func (g *GeneralLogger) Start(ctx context.Context) error {
 		for {
 			select {
 			case <-g.stopch:
+				return
 			case <-cancelFunc.Done():
 				close(g.messageQueueCh)
 				g.messageQueueCh = nil // added for datarace
@@ -150,8 +144,6 @@ func (g *GeneralLogger) write(msg logicologger.LogEvent) {
 			go func() {
 				if writer := g.Writer(); writer != nil {
 					writer.Write(bytes)
-				} else {
-					fmt.Printf("\nnil-w: %v\n", writer)
 				}
 
 			}()
@@ -161,38 +153,24 @@ func (g *GeneralLogger) write(msg logicologger.LogEvent) {
 
 func (g *GeneralLogger) Stop() error {
 	g.Lock()
-
 	g.started = false
 	g.stopped = true
 	if writer := g.Writer(); writer != nil {
 		writer.Close()
 	}
-	// closing children
 	if g.children != nil && len(g.children) > 0 {
 		for _, child := range g.children {
 			child.Stop()
 		}
 	}
-
-	//if g.messageQueueCh != nil && !g.isMessageQueueClosed() {
-
-	//close(g.messageQueueCh)
-	//g.messageQueueCh = nil // added for datarace
-	g.stopch <- true
-	//}
 	g.Unlock()
-	return nil
-}
-func (g *GeneralLogger) isMessageQueueClosed() bool {
+
 	select {
-	case <-g.messageQueueCh:
-		return true
+	case g.stopch <- true:
 	default:
 	}
-
-	return false
+	return nil
 }
-
 func (g *GeneralLogger) Level() logicologger.LogLevel {
 	return g.lvl
 }
@@ -233,6 +211,11 @@ func (g *GeneralLogger) Log(level logicologger.LogLevel, msg string, i ...interf
 		d = lastFn()
 	}
 
+	hasFormatArgs := len(arr) > 0
+	if hasFormatArgs {
+		msg = fmt.Sprintf(msg, arr...)
+	}
+
 	le := logicologger.LogEvent{
 		Message: msg,
 		Time:    time.Now(),
@@ -245,15 +228,10 @@ func (g *GeneralLogger) Log(level logicologger.LogLevel, msg string, i ...interf
 		Level:  level,
 		Indent: g.indent,
 	}
-	if g.prefix != "root:" {
-		fmt.Printf("\nprefix-g.prefix: %v\n", g.prefix)
+	select {
+	case g.messageQueueCh <- le:
+	default:
 	}
-	go func() {
-		if g.prefix != "root:" {
-			fmt.Printf("\nprefix-g.prefix: %v\n", g.prefix)
-		}
-		g.messageQueueCh <- le
-	}()
 }
 
 func (g *GeneralLogger) Debug(msg string, i ...interface{}) {
@@ -272,6 +250,10 @@ func (g *GeneralLogger) Error(msg string, i ...interface{}) {
 	g.Log(logicologger.ERROR, msg, i...)
 }
 
+func (g *GeneralLogger) Id() string {
+	return g.id
+}
+
 func (g *GeneralLogger) Prefix() string {
 	return g.prefix
 }
@@ -282,6 +264,8 @@ func (g *GeneralLogger) SetPrefix(s string) {
 
 type GeneralLoggerOption func(*GeneralLogger)
 
+const DefaultLogLevel = logicologger.ERROR | logicologger.WARN | logicologger.INFO
+
 func NewGeneralLogger(ctx context.Context, prefix string, staticData map[string]interface{}, opts ...GeneralLoggerOption) *GeneralLogger {
 	obj := &GeneralLogger{
 		GeneralLogParser: &parsers.GeneralLogParser{
@@ -291,10 +275,11 @@ func NewGeneralLogger(ctx context.Context, prefix string, staticData map[string]
 			Decorators: []decorators.LogDecorators{},
 		},
 		RWMutex:        &sync.RWMutex{},
-		messageQueueCh: make(chan logicologger.LogEvent),
+		messageQueueCh: make(chan logicologger.LogEvent, 1000),
 		prefix:         prefix,
 		id:             prefix,
-		stopch:         make(chan bool),
+		stopch:         make(chan bool, 1),
+		lvl:            DefaultLogLevel,
 	}
 	if staticData == nil {
 		staticData = make(map[string]interface{})

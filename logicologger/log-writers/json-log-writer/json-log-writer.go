@@ -5,9 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strings"
 	"sync"
-	"time"
 
 	"golang.org/x/sync/errgroup"
 )
@@ -34,7 +32,6 @@ func (w *JsonLogWriter) Write(p []byte) (int, error) {
 func (w *JsonLogWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	start := time.Now()
 
 	if w.file != nil {
 		if w.logs == nil {
@@ -50,11 +47,6 @@ func (w *JsonLogWriter) Close() error {
 				g.Go(func() error {
 					mp := map[string]interface{}{}
 					if er := json.Unmarshal(lbytes, &mp); er == nil {
-						str := string(lbytes)
-						fmt.Printf("\nlbytes-lg: %v\n", str)
-						if strings.Contains(str, "Sample") {
-							fmt.Printf("\nlg-str: %v\n", str)
-						}
 						lsCh <- mp
 					} else {
 						msg := string(lbytes)
@@ -67,7 +59,6 @@ func (w *JsonLogWriter) Close() error {
 				})
 			}
 			if err := g.Wait(); err != nil {
-				fmt.Printf("\nError:%v\n", err)
 			}
 			close(lsCh)
 			lgs := make([]map[string]interface{}, 0)
@@ -85,9 +76,6 @@ func (w *JsonLogWriter) Close() error {
 		}
 
 	}
-	elapsed := time.Since(start)
-
-	fmt.Printf("Elapsed time for writing logs: %v\n", elapsed)
 	return nil
 }
 
