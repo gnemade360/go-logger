@@ -3,6 +3,7 @@ package general_logger
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	logicologger "github.com/gnemade360/go-logger/logicologger"
 	"github.com/gnemade360/go-logger/logicologger/decorators"
 	static_data_decorator "github.com/gnemade360/go-logger/logicologger/decorators/static-data-decorator"
@@ -210,6 +211,11 @@ func (g *GeneralLogger) Log(level logicologger.LogLevel, msg string, i ...interf
 		d = lastFn()
 	}
 
+	hasFormatArgs := len(arr) > 0
+	if hasFormatArgs {
+		msg = fmt.Sprintf(msg, arr...)
+	}
+
 	le := logicologger.LogEvent{
 		Message: msg,
 		Time:    time.Now(),
@@ -244,6 +250,10 @@ func (g *GeneralLogger) Error(msg string, i ...interface{}) {
 	g.Log(logicologger.ERROR, msg, i...)
 }
 
+func (g *GeneralLogger) Id() string {
+	return g.id
+}
+
 func (g *GeneralLogger) Prefix() string {
 	return g.prefix
 }
@@ -253,6 +263,8 @@ func (g *GeneralLogger) SetPrefix(s string) {
 }
 
 type GeneralLoggerOption func(*GeneralLogger)
+
+const DefaultLogLevel = logicologger.ERROR | logicologger.WARN | logicologger.INFO
 
 func NewGeneralLogger(ctx context.Context, prefix string, staticData map[string]interface{}, opts ...GeneralLoggerOption) *GeneralLogger {
 	obj := &GeneralLogger{
@@ -267,6 +279,7 @@ func NewGeneralLogger(ctx context.Context, prefix string, staticData map[string]
 		prefix:         prefix,
 		id:             prefix,
 		stopch:         make(chan bool, 1),
+		lvl:            DefaultLogLevel,
 	}
 	if staticData == nil {
 		staticData = make(map[string]interface{})
