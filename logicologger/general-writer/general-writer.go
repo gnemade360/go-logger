@@ -31,9 +31,10 @@ func (g *GeneralWriter) Write(p []byte) (n int, err error) {
 	for _, w := range g.writers {
 		wg.Add(1)
 		go func(w io.WriteCloser) {
-
-			w.Write(p)
-			wg.Done()
+			defer wg.Done()
+			if _, writeErr := w.Write(p); writeErr != nil {
+				multiErr.Add(writeErr)
+			}
 		}(w)
 	}
 

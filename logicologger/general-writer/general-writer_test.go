@@ -1,16 +1,15 @@
 package general_writer
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 )
 
 func TestGeneralWriter_Write(t *testing.T) {
-	return
-	// Create a pipe.
 	mp := &sync.Map{}
-	//pr := newMockWriter(1, mp)
 	pw := newMockWriter(2, mp)
 	// Create a new GeneralWriter that writes to the pipe writer.
 	gw := NewGeneralWriter(pw)
@@ -102,39 +101,22 @@ func newMockWriter(i int, smp *sync.Map) *mockWriter {
 		},
 	}
 }
-func newMockWriterReturningError(i int, smp *sync.Map) interface{} {
-	return &mockWriter{
-		Key: i,
-		WriteFunc: func(p []byte) (n int, err error) {
-			if i%2 == 0 {
-				return 0, fmt.Errorf("error-%v", i)
-			} else {
-				toWrite := fmt.Sprintf("data-%v", i)
-				smp.Store(i, toWrite)
-				storeInSyncMap(smp, i, toWrite)
-				return len([]byte(toWrite)), nil
-			}
-		},
-		CloseFunc: func() error {
-			if i%2 == 0 {
-				return fmt.Errorf("error-%v", i)
-			} else {
-				toWrite := "closed"
-				storeInSyncMap(smp, i, toWrite)
-				return nil
-			}
-		},
+func TestGeneralWriter_WriteReturnsTargetErrors(t *testing.T) {
+	smp := &sync.Map{}
+	ok := newMockWriter(1, smp)
+	failing := &mockWriter{
+		WriteFunc: func(p []byte) (int, error) { return 0, errors.New("disk full") },
+		CloseFunc: func() error { return nil },
 	}
-}
+	gw := NewGeneralWriter(failing, ok)
 
-func storeInSyncMap(smp *sync.Map, i int, toWrite string) {
-	if existing, found := smp.Load(i); existing != nil && found {
-		existingMp := existing.(map[string]string)
-		if existingMp == nil {
-			existingMp = map[string]string{}
-		}
-		existingMp[toWrite] = toWrite
-		smp.Store(i, existing)
+	_, err := gw.Write([]byte("line"))
+
+	if err == nil || !strings.Contains(err.Error(), "disk full") {
+		t.Errorf("Write() error got = %v, want it to contain %q", err, "disk full")
+	}
+	if got, _ := smp.Load(1); got != "line" {
+		t.Errorf("healthy target got = %v, want %q", got, "line")
 	}
 }
 

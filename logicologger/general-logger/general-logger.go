@@ -11,6 +11,7 @@ import (
 	general_writer "github.com/gnemade360/go-logger/logicologger/general-writer"
 	"github.com/gnemade360/go-logger/logicologger/parsers"
 	"io"
+	"os"
 	"sync"
 	"time"
 )
@@ -143,7 +144,9 @@ func (g *GeneralLogger) write(msg logicologger.LogEvent) {
 		if byteConvErr == nil {
 			go func() {
 				if writer := g.Writer(); writer != nil {
-					writer.Write(bytes)
+					if _, writeErr := writer.Write(bytes); writeErr != nil {
+						fmt.Fprintf(os.Stderr, "logicologger: write failed: %v\n", writeErr)
+					}
 				}
 
 			}()
