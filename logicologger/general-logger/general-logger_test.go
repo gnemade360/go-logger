@@ -815,3 +815,20 @@ func TestGeneralLogger_ZeroStopTimeoutUsesTheDefault(t *testing.T) {
 		t.Errorf("events written before Close got = %d, want %d", got, total)
 	}
 }
+
+func TestGeneralLogger_FlushIncludesChildren(t *testing.T) {
+	const total = 20
+	w := newCloseRecorder(2 * time.Millisecond)
+	logger := newRecordedLogger(t, context.Background(), w)
+	t.Cleanup(func() { logger.Stop() })
+	child := logger.AddChild(nil, "child", "", nil)
+
+	for i := range total {
+		child.Info(strconv.Itoa(i))
+	}
+	flushWithin(t, logger)
+
+	if got := w.written.Load(); got != total {
+		t.Errorf("child events written after Flush got = %d, want %d", got, total)
+	}
+}

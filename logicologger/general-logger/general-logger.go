@@ -372,7 +372,8 @@ func (g *GeneralLogger) closeWriterAfter(writersDone []<-chan struct{}) {
 	}
 }
 
-// Flush returns once every event logged before the call has been written, or when ctx is done.
+// Flush returns once every event logged before the call, on this logger or its children, has been
+// written, or when ctx is done.
 func (g *GeneralLogger) Flush(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -380,11 +381,25 @@ func (g *GeneralLogger) Flush(ctx context.Context) error {
 	g.RLock()
 	run := g.run
 	flushCh := g.flushCh
+	children := g.children
 	g.RUnlock()
 	if run == nil {
 		return nil
 	}
 
+	for _, child := range children {
+		generalChild, isGeneral := child.(*GeneralLogger)
+		if !isGeneral {
+			continue
+		}
+		if err := generalChild.Flush(ctx); err != nil {
+			return err
+		}
+	}
+	return flushQueue(ctx, run, flushCh)
+}
+
+func flushQueue(ctx context.Context, run *loggerRun, flushCh chan chan struct{}) error {
 	reply := make(chan struct{})
 	select {
 	case flushCh <- reply:
