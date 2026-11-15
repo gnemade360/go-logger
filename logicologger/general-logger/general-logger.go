@@ -27,6 +27,8 @@ type GeneralLogger struct {
 	Formatter formatters.LogFormatter
 	*sync.RWMutex
 	messageQueueCh  chan logicologger.LogEvent
+	flushCh         chan chan struct{}
+	stopTimeout     time.Duration
 	run             *loggerRun
 	stopped         bool
 	prefix          string
@@ -42,6 +44,8 @@ type loggerRun struct {
 	closing     chan struct{}
 	done        chan struct{}
 	closingOnce sync.Once
+	stopOnce    sync.Once
+	stopErr     error
 }
 
 func newLoggerRun() *loggerRun {
@@ -77,6 +81,7 @@ func (g *GeneralLogger) AddChild(useThis logicologger.ParentLogger, prefix strin
 		Formatter:           g.Formatter,
 		RWMutex:             &sync.RWMutex{},
 		messageQueueCh:      make(chan logicologger.LogEvent, 1000),
+		stopTimeout:         g.stopTimeout,
 		prefix:              childPrefix,
 		indent:              g.indent + 1,
 		id:                  childId,
@@ -101,6 +106,7 @@ func (g *GeneralLogger) Start(ctx context.Context) error {
 	defer g.Unlock()
 	hasRun := g.run != nil
 	if hasRun && !g.stopped {
+		g.stopOnDone(ctx, g.run)
 		return nil
 	}
 	if hasRun && !isClosed(g.run.done) {
@@ -109,11 +115,30 @@ func (g *GeneralLogger) Start(ctx context.Context) error {
 	if g.messageQueueCh == nil {
 		g.messageQueueCh = make(chan logicologger.LogEvent, 1000)
 	}
+	if g.flushCh == nil {
+		g.flushCh = make(chan chan struct{})
+	}
 	run := newLoggerRun()
 	g.run = run
 	g.stopped = false
-	go g.consume(ctx, run)
+	go g.consume(run)
+	g.stopOnDone(ctx, run)
 	return nil
+}
+
+// stopOnDone stops the run when ctx is cancelled, the same way Stop does.
+func (g *GeneralLogger) stopOnDone(ctx context.Context, run *loggerRun) {
+	cancelled := ctx.Done()
+	if cancelled == nil {
+		return
+	}
+	go func() {
+		select {
+		case <-cancelled:
+			g.stopRun(run)
+		case <-run.done:
+		}
+	}()
 }
 
 func isClosed(ch <-chan struct{}) bool {
@@ -125,22 +150,30 @@ func isClosed(ch <-chan struct{}) bool {
 	}
 }
 
-func (g *GeneralLogger) consume(ctx context.Context, run *loggerRun) {
+func (g *GeneralLogger) consume(run *loggerRun) {
 	defer close(run.done)
 	for {
 		select {
 		case <-run.closing:
+			g.drain(len(g.messageQueueCh))
 			return
-		case <-ctx.Done():
-			g.seal(run)
-			return
+		case reply := <-g.flushCh:
+			g.drain(len(g.messageQueueCh))
+			close(reply)
 		case logEvent := <-g.messageQueueCh:
 			g.handle(logEvent)
 		}
 	}
 }
 
-// seal stops Log from accepting events for this run.
+func (g *GeneralLogger) drain(n int) {
+	for range n {
+		g.handle(<-g.messageQueueCh)
+	}
+}
+
+// seal stops Log from accepting events for this run. Log sends under the read lock, so once seal
+// holds the lock every accepted event is already in the queue.
 func (g *GeneralLogger) seal(run *loggerRun) {
 	g.Lock()
 	g.stopped = true
@@ -181,23 +214,80 @@ func (g *GeneralLogger) write(msg logicologger.LogEvent) {
 	}
 }
 
+// Stop stops the children, stops accepting events, writes everything already queued, then closes
+// the writer. It waits at most the stop timeout for the queue to drain, and returns an error when
+// that runs out.
 func (g *GeneralLogger) Stop() error {
-	g.Lock()
+	g.RLock()
 	run := g.run
-	g.stopped = true
-	children := g.children
-	g.Unlock()
+	g.RUnlock()
+	if run == nil {
+		return nil
+	}
+	return g.stopRun(run)
+}
 
-	if run != nil {
-		run.close()
-	}
-	if writer := g.Writer(); writer != nil {
-		writer.Close()
-	}
+func (g *GeneralLogger) stopRun(run *loggerRun) error {
+	run.stopOnce.Do(func() {
+		run.stopErr = g.shutdown(run)
+	})
+	return run.stopErr
+}
+
+func (g *GeneralLogger) shutdown(run *loggerRun) error {
+	g.RLock()
+	children := g.children
+	g.RUnlock()
 	for _, child := range children {
 		child.Stop()
 	}
-	return nil
+
+	g.seal(run)
+	timer := time.NewTimer(g.stopTimeout)
+	defer timer.Stop()
+	var timeoutErr error
+	select {
+	case <-run.done:
+	case <-timer.C:
+		timeoutErr = fmt.Errorf("logicologger: stop timed out after %s before the queue was written", g.stopTimeout)
+	}
+
+	var closeErr error
+	if writer := g.Writer(); writer != nil {
+		closeErr = writer.Close()
+	}
+	return errors.Join(timeoutErr, closeErr)
+}
+
+// Flush returns once every event logged before the call has been written, or when ctx is done.
+func (g *GeneralLogger) Flush(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	g.RLock()
+	run := g.run
+	flushCh := g.flushCh
+	g.RUnlock()
+	if run == nil {
+		return nil
+	}
+
+	reply := make(chan struct{})
+	select {
+	case flushCh <- reply:
+	case <-run.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-reply:
+		return nil
+	case <-run.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (g *GeneralLogger) Level() logicologger.LogLevel {
@@ -318,6 +408,8 @@ type GeneralLoggerOption func(*GeneralLogger)
 
 const DefaultLogLevel = logicologger.ERROR | logicologger.WARN | logicologger.INFO
 
+const DefaultStopTimeout = 5 * time.Second
+
 func NewGeneralLogger(ctx context.Context, prefix string, staticData map[string]interface{}, opts ...GeneralLoggerOption) *GeneralLogger {
 	obj := &GeneralLogger{
 		GeneralLogParser: &parsers.GeneralLogParser{
@@ -330,6 +422,7 @@ func NewGeneralLogger(ctx context.Context, prefix string, staticData map[string]
 		messageQueueCh: make(chan logicologger.LogEvent, 1000),
 		prefix:         prefix,
 		id:             prefix,
+		stopTimeout:    DefaultStopTimeout,
 	}
 	obj.lvl.Store(int32(DefaultLogLevel))
 	if staticData == nil {
@@ -348,10 +441,21 @@ func NewGeneralLogger(ctx context.Context, prefix string, staticData map[string]
 	return obj
 }
 
+// WithWriter writes every event to each of w in turn. Stop closes them, and so does the
+// GeneralWriter's finalizer, so wrap a writer that must stay open, such as os.Stdout, in one
+// whose Close does nothing.
 func WithWriter(w ...io.WriteCloser) GeneralLoggerOption {
 	genWriter := general_writer.NewGeneralWriter(w...)
 	return func(e *GeneralLogger) {
 		e.writer = genWriter
+	}
+}
+
+// WithStopTimeout sets how long Stop waits for queued events to be written. The default is
+// DefaultStopTimeout.
+func WithStopTimeout(d time.Duration) GeneralLoggerOption {
+	return func(logger *GeneralLogger) {
+		logger.stopTimeout = d
 	}
 }
 

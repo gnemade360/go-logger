@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -371,4 +372,140 @@ func TestGeneralLogger_ConcurrentLogSetLevelAndCancel(t *testing.T) {
 	time.Sleep(time.Millisecond)
 	cancel()
 	wg.Wait()
+}
+
+type closeRecorder struct {
+	delay   time.Duration
+	release chan struct{}
+	written atomic.Int64
+	atClose atomic.Int64
+	closed  chan struct{}
+	once    sync.Once
+}
+
+func newCloseRecorder(delay time.Duration) *closeRecorder {
+	w := &closeRecorder{delay: delay, closed: make(chan struct{})}
+	w.atClose.Store(-1)
+	return w
+}
+
+func (w *closeRecorder) Write(p []byte) (int, error) {
+	if w.release != nil {
+		<-w.release
+	}
+	time.Sleep(w.delay)
+	w.written.Add(1)
+	return len(p), nil
+}
+
+// Close records only the first call: GeneralWriter's finalizer closes the targets again later.
+func (w *closeRecorder) Close() error {
+	w.once.Do(func() {
+		w.atClose.Store(w.written.Load())
+		close(w.closed)
+	})
+	return nil
+}
+
+func newRecordedLogger(t *testing.T, ctx context.Context, w *closeRecorder, opts ...general_logger.GeneralLoggerOption) *general_logger.GeneralLogger {
+	t.Helper()
+	opts = append([]general_logger.GeneralLoggerOption{
+		general_logger.WithWriter(w),
+		general_logger.WithFormatter(messageFormatter{}),
+	}, opts...)
+	return general_logger.NewGeneralLogger(ctx, "flush", nil, opts...)
+}
+
+func TestGeneralLogger_StopWritesQueuedEventsBeforeClose(t *testing.T) {
+	const total = 500
+	w := newCloseRecorder(100 * time.Microsecond)
+	logger := newRecordedLogger(t, context.Background(), w)
+
+	for i := range total {
+		logger.Info(strconv.Itoa(i))
+	}
+	logger.Stop()
+
+	if got := w.atClose.Load(); got != total {
+		t.Errorf("events written before Close got = %d, want %d", got, total)
+	}
+}
+
+func TestGeneralLogger_ContextCancelFlushesLikeStop(t *testing.T) {
+	const total = 100
+	ctx, cancel := context.WithCancel(context.Background())
+	w := newCloseRecorder(100 * time.Microsecond)
+	logger := newRecordedLogger(t, ctx, w)
+	t.Cleanup(func() { logger.Stop() })
+
+	for i := range total {
+		logger.Info(strconv.Itoa(i))
+	}
+	cancel()
+
+	select {
+	case <-w.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("writer not closed after context cancel")
+	}
+	if got := w.atClose.Load(); got != total {
+		t.Errorf("events written before Close got = %d, want %d", got, total)
+	}
+}
+
+func TestGeneralLogger_FlushWritesQueuedEvents(t *testing.T) {
+	const total = 50
+	w := newCloseRecorder(200 * time.Microsecond)
+	logger := newRecordedLogger(t, context.Background(), w)
+	t.Cleanup(func() { logger.Stop() })
+
+	for i := range total {
+		logger.Info(strconv.Itoa(i))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := logger.Flush(ctx)
+
+	if err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+	if got := w.written.Load(); got != total {
+		t.Errorf("events written after Flush got = %d, want %d", got, total)
+	}
+}
+
+func TestGeneralLogger_FlushHonoursContext(t *testing.T) {
+	w := newCloseRecorder(0)
+	w.release = make(chan struct{})
+	logger := newRecordedLogger(t, context.Background(), w, general_logger.WithStopTimeout(10*time.Millisecond))
+	t.Cleanup(func() { close(w.release); logger.Stop() })
+
+	logger.Info("stuck")
+	logger.Info("queued")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err := logger.Flush(ctx)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Flush() error got = %v, want %v", err, context.DeadlineExceeded)
+	}
+}
+
+func TestGeneralLogger_StopReturnsWithinTimeoutWhenWriterHangs(t *testing.T) {
+	w := newCloseRecorder(0)
+	w.release = make(chan struct{})
+	t.Cleanup(func() { close(w.release) })
+	logger := newRecordedLogger(t, context.Background(), w, general_logger.WithStopTimeout(100*time.Millisecond))
+
+	logger.Info("hangs")
+	started := time.Now()
+	err := logger.Stop()
+	elapsed := time.Since(started)
+
+	if elapsed > time.Second {
+		t.Errorf("Stop() took %v, want about 100ms", elapsed)
+	}
+	if err == nil {
+		t.Error("Stop() error got = nil, want a timeout error")
+	}
 }
