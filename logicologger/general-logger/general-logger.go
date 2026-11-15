@@ -211,27 +211,44 @@ func (g *GeneralLogger) Log(level logicologger.LogLevel, msg string, i ...interf
 		d = lastFn()
 	}
 
-	hasFormatArgs := len(arr) > 0
-	if hasFormatArgs {
+	data := map[string]interface{}{
+		"context": d,
+	}
+	hasArgs := len(arr) > 0
+	isFormatted := hasArgs && hasFormatVerb(msg)
+	if isFormatted {
 		msg = fmt.Sprintf(msg, arr...)
+	}
+	if hasArgs && !isFormatted {
+		data["other"] = arr
 	}
 
 	le := logicologger.LogEvent{
 		Message: msg,
 		Time:    time.Now(),
-		Data: map[string]interface{}{
-			"context": d,
-			"other":   arr,
-		},
-		Prefix: g.prefix,
-		Bytes:  nil,
-		Level:  level,
-		Indent: g.indent,
+		Data:    data,
+		Prefix:  g.prefix,
+		Bytes:   nil,
+		Level:   level,
+		Indent:  g.indent,
 	}
 	select {
 	case g.messageQueueCh <- le:
 	default:
 	}
+}
+
+func hasFormatVerb(msg string) bool {
+	for i := 0; i < len(msg)-1; i++ {
+		if msg[i] != '%' {
+			continue
+		}
+		if msg[i+1] != '%' {
+			return true
+		}
+		i++
+	}
+	return false
 }
 
 func (g *GeneralLogger) Debug(msg string, i ...interface{}) {

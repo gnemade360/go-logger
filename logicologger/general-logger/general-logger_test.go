@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -109,21 +110,54 @@ func TestGeneralLogger_FormatsMessageWithArgs(t *testing.T) {
 	}
 }
 
-func TestGeneralLogger_KeepsArgsInOtherData(t *testing.T) {
-	events := make(chan logicologger.LogEvent, 1)
-	logger := newTestLogger(t, newCaptureWriter())
-	logger.OnLog = func(event logicologger.LogEvent) { events <- event }
+func TestGeneralLogger_StoresOnlyArgsTheMessageDidNotUse(t *testing.T) {
+	tests := []struct {
+		name      string
+		log       func(logicologger.Logger)
+		wantMsg   string
+		wantOther []interface{}
+	}{
+		{
+			name:    "formatted args are not stored",
+			log:     func(l logicologger.Logger) { l.Info("user %s", "bob") },
+			wantMsg: "user bob",
+		},
+		{
+			name:      "args without format verbs are stored",
+			log:       func(l logicologger.Logger) { l.Info("plain", "x") },
+			wantMsg:   "plain",
+			wantOther: []interface{}{"x"},
+		},
+		{
+			name:    "escaped percent is not a verb",
+			log:     func(l logicologger.Logger) { l.Info("100%% of %d", 3) },
+			wantMsg: "100% of 3",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			events := make(chan logicologger.LogEvent, 1)
+			logger := newTestLogger(t, newCaptureWriter())
+			logger.OnLog = func(event logicologger.LogEvent) { events <- event }
 
-	logger.Info("user %s", "bob")
+			tt.log(logger)
 
-	select {
-	case event := <-events:
-		other, _ := event.Data["other"].([]interface{})
-		if len(other) != 1 || other[0] != "bob" {
-			t.Errorf("Data[other] got = %v, want [bob]", event.Data["other"])
-		}
-	case <-time.After(time.Second):
-		t.Fatal("no log event received")
+			select {
+			case event := <-events:
+				if event.Message != tt.wantMsg {
+					t.Errorf("Message got = %q, want %q", event.Message, tt.wantMsg)
+				}
+				other, hasOther := event.Data["other"]
+				if tt.wantOther == nil && hasOther {
+					t.Errorf("Data[other] got = %v, want no key", other)
+				}
+				if tt.wantOther != nil && !reflect.DeepEqual(other, tt.wantOther) {
+					t.Errorf("Data[other] got = %v, want %v", other, tt.wantOther)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("no log event received")
+			}
+		})
 	}
 }
 
