@@ -34,7 +34,7 @@ func (t *TemplateFormatter) getTemplate() *template.Template {
 			t.MessageTemplate = `
            {{.Time}} -- {{.Message}}
            {{- if  .Data.callers  }}
-               {{(index .Data.callers 0).MessageTemplateuct}}.{{(index .Data.callers 0).Func}}============>
+               {{(index .Data.callers 0).Struct}}.{{(index .Data.callers 0).Func}}============>
            {{- end}}
            {{- if IsNotNil .Data.other}}
                {{- range $key, $val := .Data.other}}
