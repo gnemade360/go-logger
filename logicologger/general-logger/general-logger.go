@@ -28,6 +28,10 @@ type GeneralLogger struct {
 	*sync.RWMutex
 	messageQueueCh  chan logicologger.LogEvent
 	flushCh         chan chan struct{}
+	queueSize       int
+	overflow        OverflowPolicy
+	dropped         atomic.Uint64
+	droppedReported uint64
 	stopTimeout     time.Duration
 	run             *loggerRun
 	stopped         bool
@@ -46,6 +50,7 @@ type loggerRun struct {
 	closingOnce sync.Once
 	stopOnce    sync.Once
 	stopErr     error
+	inflight    sync.WaitGroup
 }
 
 func newLoggerRun() *loggerRun {
@@ -58,6 +63,19 @@ func newLoggerRun() *loggerRun {
 func (r *loggerRun) close() {
 	r.closingOnce.Do(func() { close(r.closing) })
 }
+
+// OverflowPolicy decides what Log does when the queue is full.
+type OverflowPolicy int
+
+const (
+	// OverflowDrop drops the event and counts it. The next event written is preceded by a WARN
+	// event saying how many were dropped.
+	OverflowDrop OverflowPolicy = iota
+	// OverflowBlock makes the caller wait for room in the queue.
+	OverflowBlock
+)
+
+const DefaultQueueSize = 1000
 
 var errStillStopping = errors.New("logicologger: logger is still stopping")
 
@@ -80,7 +98,8 @@ func (g *GeneralLogger) AddChild(useThis logicologger.ParentLogger, prefix strin
 		GeneralLogParser:    g.GeneralLogParser,
 		Formatter:           g.Formatter,
 		RWMutex:             &sync.RWMutex{},
-		messageQueueCh:      make(chan logicologger.LogEvent, 1000),
+		queueSize:           g.queueSize,
+		overflow:            g.overflow,
 		stopTimeout:         g.stopTimeout,
 		prefix:              childPrefix,
 		indent:              g.indent + 1,
@@ -113,7 +132,11 @@ func (g *GeneralLogger) Start(ctx context.Context) error {
 		return errStillStopping
 	}
 	if g.messageQueueCh == nil {
-		g.messageQueueCh = make(chan logicologger.LogEvent, 1000)
+		queueSize := g.queueSize
+		if queueSize <= 0 {
+			queueSize = DefaultQueueSize
+		}
+		g.messageQueueCh = make(chan logicologger.LogEvent, queueSize)
 	}
 	if g.flushCh == nil {
 		g.flushCh = make(chan chan struct{})
@@ -155,12 +178,14 @@ func (g *GeneralLogger) consume(run *loggerRun) {
 	for {
 		select {
 		case <-run.closing:
+			run.inflight.Wait()
 			g.drain(len(g.messageQueueCh))
 			return
 		case reply := <-g.flushCh:
 			g.drain(len(g.messageQueueCh))
 			close(reply)
 		case logEvent := <-g.messageQueueCh:
+			g.reportDropped()
 			g.handle(logEvent)
 		}
 	}
@@ -168,12 +193,34 @@ func (g *GeneralLogger) consume(run *loggerRun) {
 
 func (g *GeneralLogger) drain(n int) {
 	for range n {
+		g.reportDropped()
 		g.handle(<-g.messageQueueCh)
 	}
+	g.reportDropped()
 }
 
-// seal stops Log from accepting events for this run. Log sends under the read lock, so once seal
-// holds the lock every accepted event is already in the queue.
+// reportDropped writes one WARN event for the events dropped since the last report. Only the
+// consumer goroutine calls it.
+func (g *GeneralLogger) reportDropped() {
+	total := g.dropped.Load()
+	pending := total - g.droppedReported
+	if pending == 0 {
+		return
+	}
+	g.droppedReported = total
+	g.handle(logicologger.LogEvent{
+		Prefix:  g.prefix,
+		Message: fmt.Sprintf("dropped %d log events", pending),
+		Time:    time.Now(),
+		Data:    map[string]interface{}{"context": nil},
+		Level:   logicologger.WARN,
+		Indent:  g.indent,
+	})
+}
+
+// seal stops Log from accepting events for this run. Log registers in run.inflight under the read
+// lock, so once seal has held the lock no new sender can appear, and closing releases the ones
+// still waiting for room.
 func (g *GeneralLogger) seal(run *loggerRun) {
 	g.Lock()
 	g.stopped = true
@@ -352,15 +399,34 @@ func (g *GeneralLogger) Log(level logicologger.LogLevel, msg string, i ...interf
 		Indent:  g.indent,
 	}
 	g.RLock()
-	defer g.RUnlock()
-	isAccepting := g.run != nil && !g.stopped
+	run := g.run
+	isAccepting := run != nil && !g.stopped
 	if !isAccepting {
+		g.RUnlock()
+		return
+	}
+	run.inflight.Add(1)
+	g.RUnlock()
+	defer run.inflight.Done()
+
+	select {
+	case g.messageQueueCh <- le:
+		return
+	default:
+	}
+	if g.overflow != OverflowBlock {
+		g.dropped.Add(1)
 		return
 	}
 	select {
 	case g.messageQueueCh <- le:
-	default:
+	case <-run.closing:
 	}
+}
+
+// Dropped returns how many events were dropped because the queue was full.
+func (g *GeneralLogger) Dropped() uint64 {
+	return g.dropped.Load()
 }
 
 func hasFormatVerb(msg string) bool {
@@ -418,11 +484,11 @@ func NewGeneralLogger(ctx context.Context, prefix string, staticData map[string]
 		GeneralLogDecorator: &decorators.GeneralLogDecorator{
 			Decorators: []decorators.LogDecorators{},
 		},
-		RWMutex:        &sync.RWMutex{},
-		messageQueueCh: make(chan logicologger.LogEvent, 1000),
-		prefix:         prefix,
-		id:             prefix,
-		stopTimeout:    DefaultStopTimeout,
+		RWMutex:     &sync.RWMutex{},
+		prefix:      prefix,
+		id:          prefix,
+		queueSize:   DefaultQueueSize,
+		stopTimeout: DefaultStopTimeout,
 	}
 	obj.lvl.Store(int32(DefaultLogLevel))
 	if staticData == nil {
@@ -456,6 +522,21 @@ func WithWriter(w ...io.WriteCloser) GeneralLoggerOption {
 func WithStopTimeout(d time.Duration) GeneralLoggerOption {
 	return func(logger *GeneralLogger) {
 		logger.stopTimeout = d
+	}
+}
+
+// WithQueueSize sets how many events can wait to be written. The default is DefaultQueueSize,
+// which is also used for n <= 0.
+func WithQueueSize(n int) GeneralLoggerOption {
+	return func(logger *GeneralLogger) {
+		logger.queueSize = n
+	}
+}
+
+// WithOverflow sets what Log does when the queue is full. The default is OverflowDrop.
+func WithOverflow(p OverflowPolicy) GeneralLoggerOption {
+	return func(logger *GeneralLogger) {
+		logger.overflow = p
 	}
 }
 

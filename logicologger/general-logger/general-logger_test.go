@@ -509,3 +509,162 @@ func TestGeneralLogger_StopReturnsWithinTimeoutWhenWriterHangs(t *testing.T) {
 		t.Error("Stop() error got = nil, want a timeout error")
 	}
 }
+
+type gateWriter struct {
+	entered     chan struct{}
+	enteredOnce sync.Once
+	release     chan struct{}
+	mu          sync.Mutex
+	lines       []string
+}
+
+func newGateWriter() *gateWriter {
+	return &gateWriter{entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (w *gateWriter) Write(p []byte) (int, error) {
+	w.enteredOnce.Do(func() { close(w.entered) })
+	<-w.release
+	w.mu.Lock()
+	w.lines = append(w.lines, string(p))
+	w.mu.Unlock()
+	return len(p), nil
+}
+
+func (w *gateWriter) Close() error { return nil }
+
+func (w *gateWriter) written() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]string(nil), w.lines...)
+}
+
+func newGatedLogger(t *testing.T, w *gateWriter, opts ...general_logger.GeneralLoggerOption) *general_logger.GeneralLogger {
+	t.Helper()
+	opts = append([]general_logger.GeneralLoggerOption{
+		general_logger.WithWriter(w),
+		general_logger.WithFormatter(messageFormatter{}),
+	}, opts...)
+	logger := general_logger.NewGeneralLogger(context.Background(), "overflow", nil, opts...)
+	t.Cleanup(func() { logger.Stop() })
+	return logger
+}
+
+func waitEntered(t *testing.T, w *gateWriter) {
+	t.Helper()
+	select {
+	case <-w.entered:
+	case <-time.After(time.Second):
+		t.Fatal("writer was never called")
+	}
+}
+
+func flushWithin(t *testing.T, logger *general_logger.GeneralLogger) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := logger.Flush(ctx); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+}
+
+func TestGeneralLogger_ReportsDroppedEventsInTheLog(t *testing.T) {
+	const defaultQueueSize = 1000
+	w := newGateWriter()
+	logger := newGatedLogger(t, w)
+
+	logger.Info("first")
+	waitEntered(t, w)
+	for i := range defaultQueueSize + 5 {
+		logger.Info(strconv.Itoa(i))
+	}
+	close(w.release)
+	flushWithin(t, logger)
+
+	lines := w.written()
+	warnings := 0
+	for _, line := range lines {
+		if line == "dropped 5 log events" {
+			warnings++
+		}
+	}
+	if warnings != 1 {
+		t.Errorf("dropped warnings got = %d, want 1, lines written %d", warnings, len(lines))
+	}
+}
+
+func TestGeneralLogger_OverflowDropCountsAndWarnsBeforeNextEvent(t *testing.T) {
+	w := newGateWriter()
+	logger := newGatedLogger(t, w, general_logger.WithQueueSize(1))
+
+	logger.Info("e1")
+	waitEntered(t, w)
+	logger.Info("e2")
+	logger.Info("e3")
+	logger.Info("e4")
+	logger.Info("e5")
+
+	if got := logger.Dropped(); got != 3 {
+		t.Errorf("Dropped() got = %d, want 3", got)
+	}
+	close(w.release)
+	flushWithin(t, logger)
+	want := []string{"e1", "dropped 3 log events", "e2"}
+	if got := w.written(); !reflect.DeepEqual(got, want) {
+		t.Errorf("lines got = %q, want %q", got, want)
+	}
+}
+
+func TestGeneralLogger_OverflowBlockLosesNothing(t *testing.T) {
+	const total = 5
+	w := newGateWriter()
+	logger := newGatedLogger(t, w, general_logger.WithQueueSize(1), general_logger.WithOverflow(general_logger.OverflowBlock))
+
+	logged := make(chan struct{})
+	go func() {
+		defer close(logged)
+		for i := range total {
+			logger.Info(strconv.Itoa(i))
+		}
+	}()
+	waitEntered(t, w)
+	select {
+	case <-logged:
+		t.Fatal("Log returned while the queue was full, want it to wait")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(w.release)
+	<-logged
+	flushWithin(t, logger)
+
+	want := []string{"0", "1", "2", "3", "4"}
+	if got := w.written(); !reflect.DeepEqual(got, want) {
+		t.Errorf("lines got = %q, want %q", got, want)
+	}
+	if got := logger.Dropped(); got != 0 {
+		t.Errorf("Dropped() got = %d, want 0", got)
+	}
+}
+
+func TestGeneralLogger_StopReleasesBlockedLoggers(t *testing.T) {
+	w := newGateWriter()
+	logger := newGatedLogger(t, w, general_logger.WithQueueSize(1),
+		general_logger.WithOverflow(general_logger.OverflowBlock), general_logger.WithStopTimeout(50*time.Millisecond))
+	t.Cleanup(func() { close(w.release) })
+
+	logger.Info("held by the writer")
+	waitEntered(t, w)
+	logger.Info("fills the queue")
+	logged := make(chan struct{})
+	go func() {
+		defer close(logged)
+		logger.Info("waits for room")
+	}()
+	logger.Stop()
+
+	select {
+	case <-logged:
+	case <-time.After(time.Second):
+		t.Fatal("Log still blocked after Stop")
+	}
+}
