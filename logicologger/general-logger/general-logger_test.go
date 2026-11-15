@@ -2,6 +2,9 @@ package general_logger_test
 
 import (
 	"context"
+	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -168,5 +171,68 @@ func TestGeneralLogger_Id(t *testing.T) {
 	t.Cleanup(func() { child.Stop() })
 	if got := child.Id(); got != "test-_-child" {
 		t.Errorf("child Id() got = %q, want %q", got, "test-_-child")
+	}
+}
+
+type orderWriter struct {
+	mu         sync.Mutex
+	got        []int
+	inFlight   atomic.Int32
+	concurrent atomic.Bool
+	received   atomic.Int64
+}
+
+func (w *orderWriter) Write(p []byte) (int, error) {
+	if w.inFlight.Add(1) > 1 {
+		w.concurrent.Store(true)
+	}
+	defer w.inFlight.Add(-1)
+	n, err := strconv.Atoi(string(p))
+	if err != nil {
+		return 0, err
+	}
+	if n%100 == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	w.mu.Lock()
+	w.got = append(w.got, n)
+	w.mu.Unlock()
+	w.received.Add(1)
+	return len(p), nil
+}
+
+func (w *orderWriter) Close() error { return nil }
+
+func TestGeneralLogger_WritesInOrderOneAtATime(t *testing.T) {
+	const total = 10000
+	const maxAhead = 500
+	w := &orderWriter{}
+	logger := general_logger.NewGeneralLogger(context.Background(), "order", nil,
+		general_logger.WithWriter(w), general_logger.WithFormatter(messageFormatter{}))
+	t.Cleanup(func() { logger.Stop() })
+
+	for i := 0; i < total; i++ {
+		for int64(i)-w.received.Load() > maxAhead {
+			time.Sleep(50 * time.Microsecond)
+		}
+		logger.Info(strconv.Itoa(i))
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for w.received.Load() < total && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+
+	if w.concurrent.Load() {
+		t.Error("writer was called concurrently")
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.got) != total {
+		t.Fatalf("events written got = %d, want %d", len(w.got), total)
+	}
+	for i, n := range w.got {
+		if n != i {
+			t.Fatalf("event at position %d got = %d, want %d", i, n, i)
+		}
 	}
 }

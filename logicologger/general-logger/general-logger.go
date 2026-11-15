@@ -142,14 +142,11 @@ func (g *GeneralLogger) write(msg logicologger.LogEvent) {
 		}
 
 		if byteConvErr == nil {
-			go func() {
-				if writer := g.Writer(); writer != nil {
-					if _, writeErr := writer.Write(bytes); writeErr != nil {
-						fmt.Fprintf(os.Stderr, "logicologger: write failed: %v\n", writeErr)
-					}
+			if writer := g.Writer(); writer != nil {
+				if _, writeErr := writer.Write(bytes); writeErr != nil {
+					fmt.Fprintf(os.Stderr, "logicologger: write failed: %v\n", writeErr)
 				}
-
-			}()
+			}
 		}
 	}
 }

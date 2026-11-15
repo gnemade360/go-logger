@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestGeneralWriter_Write(t *testing.T) {
@@ -82,6 +84,33 @@ func TestGeneralWriter_WriteConcurrent(t *testing.T) {
 				fmt.Printf("\ns-s: %v\n", s)
 			}
 		}
+	}
+}
+
+func TestGeneralWriter_WritesTargetsOneAfterAnother(t *testing.T) {
+	var inFlight atomic.Int32
+	var overlapped atomic.Bool
+	slowTarget := func() *mockWriter {
+		return &mockWriter{
+			WriteFunc: func(p []byte) (int, error) {
+				if inFlight.Add(1) > 1 {
+					overlapped.Store(true)
+				}
+				time.Sleep(10 * time.Millisecond)
+				inFlight.Add(-1)
+				return len(p), nil
+			},
+			CloseFunc: func() error { return nil },
+		}
+	}
+	gw := NewGeneralWriter(slowTarget(), slowTarget())
+
+	if _, err := gw.Write([]byte("line")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+
+	if overlapped.Load() {
+		t.Error("targets were written at the same time")
 	}
 }
 
