@@ -1,7 +1,11 @@
 package general_logger_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -10,6 +14,8 @@ import (
 
 	logicologger "github.com/gnemade360/go-logger/logicologger"
 	general_logger "github.com/gnemade360/go-logger/logicologger/general-logger"
+	file_log_writer "github.com/gnemade360/go-logger/logicologger/log-writers/file-log-writer"
+	map_log_writer "github.com/gnemade360/go-logger/logicologger/log-writers/map-log-writer"
 )
 
 type messageFormatter struct{}
@@ -234,5 +240,72 @@ func TestGeneralLogger_WritesInOrderOneAtATime(t *testing.T) {
 		if n != i {
 			t.Fatalf("event at position %d got = %d, want %d", i, n, i)
 		}
+	}
+}
+
+type bufferWriter struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (w *bufferWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(p)
+}
+
+func (w *bufferWriter) Close() error { return nil }
+
+func (w *bufferWriter) waitForLines(n int) []byte {
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		w.mu.Lock()
+		hasAll := bytes.Count(w.buf.Bytes(), []byte("\n")) >= n
+		out := append([]byte(nil), w.buf.Bytes()...)
+		w.mu.Unlock()
+		if hasAll {
+			return out
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]byte(nil), w.buf.Bytes()...)
+}
+
+func TestGeneralLogger_DefaultOutputIsOneJSONObjectPerLine(t *testing.T) {
+	w := &bufferWriter{}
+	logger := general_logger.NewGeneralLogger(context.Background(), "lines", nil, general_logger.WithWriter(w))
+	t.Cleanup(func() { logger.Stop() })
+
+	logger.Info("first")
+	logger.Info("second")
+	out := w.waitForLines(2)
+
+	lines := bytes.Split(bytes.TrimSuffix(out, []byte("\n")), []byte("\n"))
+	if len(lines) != 2 {
+		t.Fatalf("lines got = %d, want 2, output %q", len(lines), out)
+	}
+	mapWriter := map_log_writer.NewMapLogWriter()
+	for i, line := range lines {
+		if !json.Valid(line) {
+			t.Errorf("line %d is not valid JSON: %q", i, line)
+		}
+		if _, err := mapWriter.Write(append(line, '\n')); err != nil {
+			t.Errorf("map writer rejected line %d: %v", i, err)
+		}
+	}
+	path := filepath.Join(t.TempDir(), "log.ndjson")
+	fileWriter, err := file_log_writer.NewFileLogWriter(path)
+	if err != nil {
+		t.Fatalf("NewFileLogWriter() error = %v", err)
+	}
+	if _, err := fileWriter.Write(out); err != nil {
+		t.Fatalf("file writer Write() error = %v", err)
+	}
+	fileWriter.Close()
+	written, _ := os.ReadFile(path)
+	if got := bytes.Count(written, []byte("\n")); got != 2 {
+		t.Errorf("file lines got = %d, want 2", got)
 	}
 }

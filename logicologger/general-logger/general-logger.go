@@ -112,7 +112,7 @@ func (g *GeneralLogger) Start(ctx context.Context) error {
 						var er error
 						bytes, er := json.Marshal(logEvent)
 						if er == nil {
-							logEvent.Bytes = bytes
+							logEvent.Bytes = append(bytes, '\n')
 						}
 					}
 

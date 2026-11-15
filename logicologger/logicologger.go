@@ -25,6 +25,21 @@ const (
 	WARN
 )
 
+var levelNames = map[LogLevel]string{
+	ERROR: "ERROR",
+	INFO:  "INFO",
+	DEBUG: "DEBUG",
+	WARN:  "WARN",
+}
+
+// LevelName returns the name of a single level, or "UNKNOWN" for anything else, such as a combined mask.
+func LevelName(level LogLevel) string {
+	if name, ok := levelNames[level]; ok {
+		return name
+	}
+	return "UNKNOWN"
+}
+
 type (
 	LogData map[string]interface{}
 
