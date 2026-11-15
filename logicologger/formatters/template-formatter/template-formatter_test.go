@@ -1,99 +1,66 @@
 package template_formatter_test
 
 import (
-	"reflect"
+	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
-	"text/template"
 	"time"
 
 	logicologger "github.com/gnemade360/go-logger/logicologger"
+	caller_collector "github.com/gnemade360/go-logger/logicologger/decorators/caller-collector"
 	template_formatter "github.com/gnemade360/go-logger/logicologger/formatters/template-formatter"
 )
 
-func TestTemplateFormatter_Format(t1 *testing.T) {
-	type fields struct {
-		Str      string
-		template template.Template
+func formatToEvent(t *testing.T, f template_formatter.TemplateFormatter, event logicologger.LogEvent) logicologger.LogEvent {
+	t.Helper()
+	gotB, err := f.Format(event)
+	if err != nil {
+		t.Fatalf("Format() error = %v", err)
 	}
-	type args struct {
-		event logicologger.LogEvent
+	var got logicologger.LogEvent
+	if err := json.Unmarshal(gotB, &got); err != nil {
+		t.Fatalf("Format() output is not a JSON event: %v, output %q", err, gotB)
 	}
+	return got
+}
+
+func TestTemplateFormatter_DefaultTemplateKeepsMessage(t *testing.T) {
 	tests := []struct {
-		name    string
-		fields  fields
-		args    args
-		want    []byte
-		wantErr bool
+		name string
+		data map[string]interface{}
 	}{
-		// TODO: Add test cases.
-		{
-			name: "1",
-			fields: fields{
-				Str: "",
-			},
-			args: args{
-				event: logicologger.LogEvent{
-					Message: "Starting task",
-					Time:    time.Now(),
-					Data: map[string]interface{}{
-						"other": []interface{}{"first", "second"},
-					},
-				},
-			},
-			want:    nil,
-			wantErr: false,
-		},
-		{
-			name: "2",
-			fields: fields{
-				Str: "",
-			},
-			args: args{
-				event: logicologger.LogEvent{
-					Message: "Starting task",
-					Time:    time.Now(),
-					Data: map[string]interface{}{
-						"other": []interface{}{map[string]interface{}{
-							"name": "parrot",
-						}},
-					},
-				},
-			},
-			want:    nil,
-			wantErr: false,
-		},
-		{
-			name: "2",
-			fields: fields{
-				Str: "",
-			},
-			args: args{
-				event: logicologger.LogEvent{
-					Message: "Starting task", Time: time.Now(), Data: map[string]interface{}{
-						"callers": nil,
-					},
-				},
-			},
-			want:    nil,
-			wantErr: false,
-		},
+		{name: "scalar args", data: map[string]interface{}{"other": []interface{}{"first", "second"}}},
+		{name: "map arg", data: map[string]interface{}{"other": []interface{}{map[string]interface{}{"name": "parrot"}}}},
+		{name: "nil callers", data: map[string]interface{}{"callers": nil}},
 	}
 	for _, tt := range tests {
-		t1.Run(tt.name, func(t1 *testing.T) {
-			t := template_formatter.TemplateFormatter{
-				MessageTemplate: tt.fields.Str,
-				RWMutex:         &sync.RWMutex{},
-			}
-			gotB, err := t.Format(tt.args.event)
-			got := string(gotB)
-			if (err != nil) != tt.wantErr {
-				t1.Errorf("Format() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if !reflect.DeepEqual(got, tt.want) {
-				t1.Errorf("Format() got = %v, want %v", got, tt.want)
+		t.Run(tt.name, func(t *testing.T) {
+			f := template_formatter.TemplateFormatter{RWMutex: &sync.RWMutex{}}
+			event := logicologger.LogEvent{Message: "Starting task", Time: time.Now(), Data: tt.data}
+
+			got := formatToEvent(t, f, event)
+
+			if got.Message != "Starting task" {
+				t.Errorf("Message got = %q, want %q", got.Message, "Starting task")
 			}
 		})
+	}
+}
+
+func TestTemplateFormatter_IncludeCallersRendersFirstCaller(t *testing.T) {
+	f := template_formatter.TemplateFormatter{RWMutex: &sync.RWMutex{}, IncludeCallers: true}
+	event := logicologger.LogEvent{
+		Message: "Starting task",
+		Time:    time.Now(),
+		Data: map[string]interface{}{
+			"callers": []*caller_collector.Caller{{Struct: "Worker", Func: "Run"}},
+		},
+	}
+
+	got := formatToEvent(t, f, event)
+
+	if !strings.Contains(got.Message, "Worker.Run") {
+		t.Errorf("Message got = %q, want it to contain %q", got.Message, "Worker.Run")
 	}
 }

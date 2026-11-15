@@ -10,6 +10,7 @@ import (
 
 type GeneralWriter struct {
 	writers []io.WriteCloser
+	mu      sync.Mutex
 }
 
 func NewGeneralWriter(writers ...io.WriteCloser) *GeneralWriter {
@@ -23,25 +24,23 @@ func NewGeneralWriter(writers ...io.WriteCloser) *GeneralWriter {
 }
 
 func (g *GeneralWriter) Write(p []byte) (n int, err error) {
-	var mu sync.RWMutex
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	multiErr := &multi_error.MultiError{
-		RWMutex: &mu,
+		RWMutex: &sync.RWMutex{},
 	}
-	wg := &sync.WaitGroup{}
 	for _, w := range g.writers {
-		wg.Add(1)
-		go func(w io.WriteCloser) {
-
-			w.Write(p)
-			wg.Done()
-		}(w)
+		if _, writeErr := w.Write(p); writeErr != nil {
+			multiErr.Add(writeErr)
+		}
 	}
-
-	wg.Wait()
 	return len(p), multiErr.ErrorOrNil()
 }
 
+// Close waits for a Write in progress, then closes every target.
 func (g *GeneralWriter) Close() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	var mu sync.RWMutex
 	multiErr := &multi_error.MultiError{
 		RWMutex: &mu,
