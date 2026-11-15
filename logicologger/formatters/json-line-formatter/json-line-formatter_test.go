@@ -35,6 +35,7 @@ func TestJSONLineFormatter_Format(t *testing.T) {
 		Level:   logicologger.WARN,
 		Data: logicologger.LogData{
 			"service": "llm",
+			"status":  "static value loses to the context",
 			"msg":     "static value loses to the message",
 			"other":   []interface{}{"secret"},
 			"context": map[string]interface{}{"status": float64(200), "level": "context value loses to the level"},
@@ -58,6 +59,21 @@ func TestJSONLineFormatter_Format(t *testing.T) {
 		if got[k] != v {
 			t.Errorf("%s got = %v, want %v", k, got[k], v)
 		}
+	}
+}
+
+func TestJSONLineFormatter_LogDataContextIsFlattened(t *testing.T) {
+	event := logicologger.LogEvent{
+		Data: logicologger.LogData{"context": logicologger.LogData{"request_id": "r1"}},
+	}
+
+	got := formatLine(t, json_line_formatter.JSONLineFormatter{}, event)
+
+	if got["request_id"] != "r1" {
+		t.Errorf("request_id got = %v, want %q", got["request_id"], "r1")
+	}
+	if _, hasContext := got["context"]; hasContext {
+		t.Errorf("context key got = %v, want it flattened", got["context"])
 	}
 }
 

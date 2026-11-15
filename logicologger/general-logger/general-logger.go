@@ -71,9 +71,11 @@ type OverflowPolicy int
 
 const (
 	// OverflowDrop drops the event and counts it. The next event written is preceded by a WARN
-	// event saying how many were dropped.
+	// event saying how many were dropped, written whatever the logger's level.
 	OverflowDrop OverflowPolicy = iota
-	// OverflowBlock makes the caller wait for room in the queue.
+	// OverflowBlock makes the caller wait for room in the queue. Code that runs on the consumer,
+	// such as OnLog, a decorator, a parser or a writer, must not log to the same logger: with a
+	// full queue it would wait for room only it can make, and every caller would wait until Stop.
 	OverflowBlock
 )
 
@@ -505,7 +507,8 @@ func (g *GeneralLogger) Log(level logicologger.LogLevel, msg string, i ...interf
 	}
 }
 
-// Dropped returns how many events were dropped because the queue was full.
+// Dropped returns how many events this logger dropped because its queue was full. Each child
+// counts its own.
 func (g *GeneralLogger) Dropped() uint64 {
 	return g.dropped.Load()
 }

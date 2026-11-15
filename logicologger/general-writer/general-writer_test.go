@@ -2,7 +2,6 @@ package general_writer
 
 import (
 	"errors"
-	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -37,53 +36,40 @@ func TestGeneralWriter_Write(t *testing.T) {
 
 }
 
-func TestGeneralWriter_WriteConcurrent(t *testing.T) {
-	// Create a pipe.
-	smp := &sync.Map{}
-	pr := newMockWriter(1, smp)
-	pw := newMockWriter(2, smp)
+func TestGeneralWriter_WriteConcurrentCallsAreSerialised(t *testing.T) {
+	var inFlight atomic.Int32
+	var overlapped atomic.Bool
+	target := &mockWriter{
+		WriteFunc: func(p []byte) (int, error) {
+			if inFlight.Add(1) > 1 {
+				overlapped.Store(true)
+			}
+			time.Sleep(time.Millisecond)
+			inFlight.Add(-1)
+			return len(p), nil
+		},
+		CloseFunc: func() error { return nil },
+	}
+	gw := NewGeneralWriter(target)
 
-	defer pr.Close()
-	defer pw.Close()
-
-	// Create a new GeneralWriter that writes to the pipe writer.
-	gw := NewGeneralWriter(pw, pr)
-
-	// Use a WaitGroup to wait for all goroutines to finish.
 	var wg sync.WaitGroup
-
-	// Start multiple goroutines to write to the GeneralWriter concurrently.
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			bytes := []byte{byte('a' + i)}
-			n, err := gw.Write(bytes)
+			n, err := gw.Write([]byte{byte('a' + i)})
 			if err != nil {
-				t.Errorf("unexpected error writing data: %v", err)
+				t.Errorf("Write() error = %v", err)
 			}
 			if n != 1 {
-				t.Errorf("unexpected number of bytes written: got %d, want %d", n, 1)
+				t.Errorf("Write() n got = %d, want 1", n)
 			}
 		}(i)
 	}
-
-	// Wait for all goroutines to finish.
 	wg.Wait()
 
-	// Close the GeneralWriter.
-	if err := gw.Close(); err != nil {
-		t.Errorf("unexpected error during Close: %v", err)
-	}
-
-	// Read the data from the pipe line-readers and verify that it matches the expected value.
-	for i := 0; i < 10; i++ {
-		if s, e := smp.Load(i); e {
-
-			if s == "" {
-				fmt.Printf("\ns-s: %v\n", s)
-			}
-		}
+	if overlapped.Load() {
+		t.Error("target was written by two Write calls at the same time")
 	}
 }
 

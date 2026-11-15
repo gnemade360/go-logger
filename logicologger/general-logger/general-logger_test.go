@@ -252,13 +252,16 @@ func TestGeneralLogger_WritesInOrderOneAtATime(t *testing.T) {
 		general_logger.WithWriter(w), general_logger.WithFormatter(messageFormatter{}))
 	t.Cleanup(func() { logger.Stop() })
 
+	deadline := time.Now().Add(10 * time.Second)
 	for i := 0; i < total; i++ {
 		for int64(i)-w.received.Load() > maxAhead {
+			if time.Now().After(deadline) {
+				t.Fatalf("writer stalled at %d of %d events", w.received.Load(), total)
+			}
 			time.Sleep(50 * time.Microsecond)
 		}
 		logger.Info(strconv.Itoa(i))
 	}
-	deadline := time.Now().Add(10 * time.Second)
 	for w.received.Load() < total && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
@@ -339,12 +342,17 @@ func TestGeneralLogger_DefaultOutputIsOneJSONObjectPerLine(t *testing.T) {
 		t.Fatalf("file writer Write() error = %v", err)
 	}
 	fileWriter.Close()
-	written, _ := os.ReadFile(path)
+	written, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
 	if got := bytes.Count(written, []byte("\n")); got != 2 {
 		t.Errorf("file lines got = %d, want 2", got)
 	}
 }
 
+// Run with -race: the data races this guards against are only reported by the race detector.
+// Without it, the test still catches a send-on-closed-channel panic.
 func TestGeneralLogger_ConcurrentLogSetLevelAndCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	logger := general_logger.NewGeneralLogger(ctx, "race", nil,
@@ -424,8 +432,11 @@ func TestGeneralLogger_StopWritesQueuedEventsBeforeClose(t *testing.T) {
 	for i := range total {
 		logger.Info(strconv.Itoa(i))
 	}
-	logger.Stop()
+	err := logger.Stop()
 
+	if err != nil {
+		t.Errorf("Stop() error = %v", err)
+	}
 	if got := w.atClose.Load(); got != total {
 		t.Errorf("events written before Close got = %d, want %d", got, total)
 	}
@@ -502,11 +513,11 @@ func TestGeneralLogger_StopReturnsWithinTimeoutWhenWriterHangs(t *testing.T) {
 	err := logger.Stop()
 	elapsed := time.Since(started)
 
-	if elapsed > time.Second {
+	if elapsed < 90*time.Millisecond || elapsed > time.Second {
 		t.Errorf("Stop() took %v, want about 100ms", elapsed)
 	}
-	if err == nil {
-		t.Error("Stop() error got = nil, want a timeout error")
+	if !errors.Is(err, general_logger.ErrStopTimeout) {
+		t.Errorf("Stop() error got = %v, want %v", err, general_logger.ErrStopTimeout)
 	}
 }
 
@@ -569,13 +580,12 @@ func flushWithin(t *testing.T, logger *general_logger.GeneralLogger) {
 }
 
 func TestGeneralLogger_ReportsDroppedEventsInTheLog(t *testing.T) {
-	const defaultQueueSize = 1000
 	w := newGateWriter()
 	logger := newGatedLogger(t, w)
 
 	logger.Info("first")
 	waitEntered(t, w)
-	for i := range defaultQueueSize + 5 {
+	for i := range general_logger.DefaultQueueSize + 5 {
 		logger.Info(strconv.Itoa(i))
 	}
 	close(w.release)
@@ -660,6 +670,11 @@ func TestGeneralLogger_StopReleasesBlockedLoggers(t *testing.T) {
 		defer close(logged)
 		logger.Info("waits for room")
 	}()
+	select {
+	case <-logged:
+		t.Fatal("Log returned while the queue was full, want it to wait")
+	case <-time.After(50 * time.Millisecond):
+	}
 	logger.Stop()
 
 	select {
