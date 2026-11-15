@@ -3,6 +3,7 @@ package general_logger
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	logicologger "github.com/gnemade360/go-logger/logicologger"
 	"github.com/gnemade360/go-logger/logicologger/decorators"
@@ -13,20 +14,20 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type GeneralLogger struct {
 	writer logicologger.LogWriter
-	lvl    logicologger.LogLevel
+	lvl    atomic.Int32
 	logicologger.ParentLogger
 	*decorators.GeneralLogDecorator
 	*parsers.GeneralLogParser
 	Formatter formatters.LogFormatter
 	*sync.RWMutex
 	messageQueueCh  chan logicologger.LogEvent
-	stopch          chan bool
-	started         bool
+	run             *loggerRun
 	stopped         bool
 	prefix          string
 	children        []logicologger.ParentLogger
@@ -35,6 +36,26 @@ type GeneralLogger struct {
 	indent          int
 	PrefixDelimiter string
 }
+
+// loggerRun is the lifecycle of one consumer goroutine, from Start to its exit.
+type loggerRun struct {
+	closing     chan struct{}
+	done        chan struct{}
+	closingOnce sync.Once
+}
+
+func newLoggerRun() *loggerRun {
+	return &loggerRun{
+		closing: make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+}
+
+func (r *loggerRun) close() {
+	r.closingOnce.Do(func() { close(r.closing) })
+}
+
+var errStillStopping = errors.New("logicologger: logger is still stopping")
 
 func (g *GeneralLogger) AddChild(useThis logicologger.ParentLogger, prefix string, id string, data map[string]interface{}) logicologger.ParentLogger {
 	if g == nil {
@@ -50,85 +71,94 @@ func (g *GeneralLogger) AddChild(useThis logicologger.ParentLogger, prefix strin
 	}
 	childPrefix := g.Prefix() + pdml + prefix
 	childId := childPrefix
-	useThis = &GeneralLogger{
-		//writer:              g.writer,
-		lvl:                 g.lvl,
+	child := &GeneralLogger{
 		GeneralLogDecorator: g.GeneralLogDecorator,
 		GeneralLogParser:    g.GeneralLogParser,
 		Formatter:           g.Formatter,
 		RWMutex:             &sync.RWMutex{},
 		messageQueueCh:      make(chan logicologger.LogEvent, 1000),
-		started:             false,
-		stopped:             false,
 		prefix:              childPrefix,
 		indent:              g.indent + 1,
 		id:                  childId,
 		OnLog: func(event logicologger.LogEvent) {
 			g.write(event)
 		},
-		stopch: make(chan bool, 1),
 	}
-	g.children = append(g.children, useThis)
-	useThis.Start(context.Background())
-	return useThis
+	child.lvl.Store(g.lvl.Load())
+	g.children = append(g.children, child)
+	child.Start(context.Background())
+	return child
 }
 
 func (g *GeneralLogger) Start(ctx context.Context) error {
 	if g == nil {
 		return nil
 	}
-	var cancelFunc context.Context = context.Background()
-	if ctx != nil {
-		cancelFunc = ctx
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	g.RWMutex.Lock()
-	//defer func() {
-	//    g.RWMutex.Unlock()
-	//}()
-	g.started = true
-	g.stopped = false
+	g.Lock()
+	defer g.Unlock()
+	hasRun := g.run != nil
+	if hasRun && !g.stopped {
+		return nil
+	}
+	if hasRun && !isClosed(g.run.done) {
+		return errStillStopping
+	}
 	if g.messageQueueCh == nil {
 		g.messageQueueCh = make(chan logicologger.LogEvent, 1000)
 	}
-	g.RWMutex.Unlock()
-
-	go func() {
-		for {
-			select {
-			case <-g.stopch:
-				return
-			case <-cancelFunc.Done():
-				close(g.messageQueueCh)
-				g.messageQueueCh = nil // added for datarace
-			case logEvent, ok := <-g.messageQueueCh:
-				if !ok {
-					g.Lock()
-					g.messageQueueCh = nil // added for datarace
-					g.Unlock()
-				} else {
-					// result of the channel
-					g.Decorate(&logEvent)
-					if logEvent.Bytes == nil || len(logEvent.Bytes) == 0 {
-						var er error
-						bytes, er := json.Marshal(logEvent)
-						if er == nil {
-							logEvent.Bytes = append(bytes, '\n')
-						}
-					}
-
-					g.write(logEvent)
-					if g.OnLog != nil {
-						g.OnLog(logEvent)
-					}
-				}
-			}
-			if g.messageQueueCh == nil {
-				break
-			}
-		}
-	}()
-
+	run := newLoggerRun()
+	g.run = run
+	g.stopped = false
+	go g.consume(ctx, run)
 	return nil
+}
+
+func isClosed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+func (g *GeneralLogger) consume(ctx context.Context, run *loggerRun) {
+	defer close(run.done)
+	for {
+		select {
+		case <-run.closing:
+			return
+		case <-ctx.Done():
+			g.seal(run)
+			return
+		case logEvent := <-g.messageQueueCh:
+			g.handle(logEvent)
+		}
+	}
+}
+
+// seal stops Log from accepting events for this run.
+func (g *GeneralLogger) seal(run *loggerRun) {
+	g.Lock()
+	g.stopped = true
+	g.Unlock()
+	run.close()
+}
+
+func (g *GeneralLogger) handle(logEvent logicologger.LogEvent) {
+	g.Decorate(&logEvent)
+	if len(logEvent.Bytes) == 0 {
+		if bytes, err := json.Marshal(logEvent); err == nil {
+			logEvent.Bytes = append(bytes, '\n')
+		}
+	}
+	g.write(logEvent)
+	if g.OnLog != nil {
+		g.OnLog(logEvent)
+	}
 }
 
 func (g *GeneralLogger) write(msg logicologger.LogEvent) {
@@ -153,30 +183,29 @@ func (g *GeneralLogger) write(msg logicologger.LogEvent) {
 
 func (g *GeneralLogger) Stop() error {
 	g.Lock()
-	g.started = false
+	run := g.run
 	g.stopped = true
+	children := g.children
+	g.Unlock()
+
+	if run != nil {
+		run.close()
+	}
 	if writer := g.Writer(); writer != nil {
 		writer.Close()
 	}
-	if g.children != nil && len(g.children) > 0 {
-		for _, child := range g.children {
-			child.Stop()
-		}
-	}
-	g.Unlock()
-
-	select {
-	case g.stopch <- true:
-	default:
+	for _, child := range children {
+		child.Stop()
 	}
 	return nil
 }
+
 func (g *GeneralLogger) Level() logicologger.LogLevel {
-	return g.lvl
+	return logicologger.LogLevel(g.lvl.Load())
 }
 
 func (g *GeneralLogger) SetLevel(lvl logicologger.LogLevel) {
-	g.lvl = lvl
+	g.lvl.Store(int32(lvl))
 }
 
 func (g *GeneralLogger) Writer() logicologger.LogWriter {
@@ -188,7 +217,7 @@ func (g *GeneralLogger) Writer() logicologger.LogWriter {
 }
 func (g *GeneralLogger) Log(level logicologger.LogLevel, msg string, i ...interface{}) {
 
-	if level&(g.lvl) != level {
+	if level&g.Level() != level {
 		return
 	}
 
@@ -231,6 +260,12 @@ func (g *GeneralLogger) Log(level logicologger.LogLevel, msg string, i ...interf
 		Bytes:   nil,
 		Level:   level,
 		Indent:  g.indent,
+	}
+	g.RLock()
+	defer g.RUnlock()
+	isAccepting := g.run != nil && !g.stopped
+	if !isAccepting {
+		return
 	}
 	select {
 	case g.messageQueueCh <- le:
@@ -295,9 +330,8 @@ func NewGeneralLogger(ctx context.Context, prefix string, staticData map[string]
 		messageQueueCh: make(chan logicologger.LogEvent, 1000),
 		prefix:         prefix,
 		id:             prefix,
-		stopch:         make(chan bool, 1),
-		lvl:            DefaultLogLevel,
 	}
+	obj.lvl.Store(int32(DefaultLogLevel))
 	if staticData == nil {
 		staticData = make(map[string]interface{})
 	}
@@ -329,7 +363,7 @@ func WithLogParser(parser ...logicologger.LogParser) GeneralLoggerOption {
 
 func WithLogLevel(level logicologger.LogLevel) GeneralLoggerOption {
 	return func(logger *GeneralLogger) {
-		logger.lvl = level
+		logger.SetLevel(level)
 	}
 }
 

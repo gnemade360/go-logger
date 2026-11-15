@@ -343,3 +343,32 @@ func TestGeneralLogger_DefaultOutputIsOneJSONObjectPerLine(t *testing.T) {
 		t.Errorf("file lines got = %d, want 2", got)
 	}
 }
+
+func TestGeneralLogger_ConcurrentLogSetLevelAndCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	logger := general_logger.NewGeneralLogger(ctx, "race", nil,
+		general_logger.WithWriter(&bufferWriter{}), general_logger.WithFormatter(messageFormatter{}))
+	t.Cleanup(func() { logger.Stop() })
+
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 2000 {
+				logger.Info("event")
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for range 500 {
+			logger.SetLevel(logicologger.INFO | logicologger.DEBUG)
+			_ = logger.Level()
+		}
+	}()
+	time.Sleep(time.Millisecond)
+	cancel()
+	wg.Wait()
+}
