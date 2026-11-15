@@ -43,7 +43,8 @@ type GeneralLogger struct {
 	PrefixDelimiter string
 }
 
-// loggerRun is the lifecycle of one consumer goroutine, from Start to its exit.
+// loggerRun is the lifecycle of the consumer goroutine, from Start to its exit. abandoned is set
+// when Stop times out: the consumer then drops what is still queued instead of writing it.
 type loggerRun struct {
 	closing     chan struct{}
 	done        chan struct{}
@@ -51,6 +52,7 @@ type loggerRun struct {
 	stopOnce    sync.Once
 	stopErr     error
 	inflight    sync.WaitGroup
+	abandoned   atomic.Bool
 }
 
 func newLoggerRun() *loggerRun {
@@ -77,7 +79,12 @@ const (
 
 const DefaultQueueSize = 1000
 
-var errStillStopping = errors.New("logicologger: logger is still stopping")
+var (
+	// ErrStopped is returned by Start after Stop. A stopped logger cannot be restarted.
+	ErrStopped = errors.New("logicologger: logger is stopped")
+	// ErrStopTimeout is returned by Stop when queued events were not written within the stop timeout.
+	ErrStopTimeout = errors.New("logicologger: stop timed out")
+)
 
 func (g *GeneralLogger) AddChild(useThis logicologger.ParentLogger, prefix string, id string, data map[string]interface{}) logicologger.ParentLogger {
 	if g == nil {
@@ -109,6 +116,9 @@ func (g *GeneralLogger) AddChild(useThis logicologger.ParentLogger, prefix strin
 		},
 	}
 	child.lvl.Store(g.lvl.Load())
+	if g.stopped {
+		return child
+	}
 	g.children = append(g.children, child)
 	child.Start(context.Background())
 	return child
@@ -123,13 +133,12 @@ func (g *GeneralLogger) Start(ctx context.Context) error {
 	}
 	g.Lock()
 	defer g.Unlock()
-	hasRun := g.run != nil
-	if hasRun && !g.stopped {
+	if g.stopped {
+		return ErrStopped
+	}
+	if g.run != nil {
 		g.stopOnDone(ctx, g.run)
 		return nil
-	}
-	if hasRun && !isClosed(g.run.done) {
-		return errStillStopping
 	}
 	if g.messageQueueCh == nil {
 		queueSize := g.queueSize
@@ -143,7 +152,6 @@ func (g *GeneralLogger) Start(ctx context.Context) error {
 	}
 	run := newLoggerRun()
 	g.run = run
-	g.stopped = false
 	go g.consume(run)
 	g.stopOnDone(ctx, run)
 	return nil
@@ -158,19 +166,10 @@ func (g *GeneralLogger) stopOnDone(ctx context.Context, run *loggerRun) {
 	go func() {
 		select {
 		case <-cancelled:
-			g.stopRun(run)
+			g.Stop()
 		case <-run.done:
 		}
 	}()
-}
-
-func isClosed(ch <-chan struct{}) bool {
-	select {
-	case <-ch:
-		return true
-	default:
-		return false
-	}
 }
 
 func (g *GeneralLogger) consume(run *loggerRun) {
@@ -179,10 +178,10 @@ func (g *GeneralLogger) consume(run *loggerRun) {
 		select {
 		case <-run.closing:
 			run.inflight.Wait()
-			g.drain(len(g.messageQueueCh))
+			g.drain(run, len(g.messageQueueCh))
 			return
 		case reply := <-g.flushCh:
-			g.drain(len(g.messageQueueCh))
+			g.drain(run, len(g.messageQueueCh))
 			close(reply)
 		case logEvent := <-g.messageQueueCh:
 			g.reportDropped()
@@ -191,12 +190,19 @@ func (g *GeneralLogger) consume(run *loggerRun) {
 	}
 }
 
-func (g *GeneralLogger) drain(n int) {
+func (g *GeneralLogger) drain(run *loggerRun, n int) {
 	for range n {
+		logEvent := <-g.messageQueueCh
+		if run.abandoned.Load() {
+			g.dropped.Add(1)
+			continue
+		}
 		g.reportDropped()
-		g.handle(<-g.messageQueueCh)
+		g.handle(logEvent)
 	}
-	g.reportDropped()
+	if !run.abandoned.Load() {
+		g.reportDropped()
+	}
 }
 
 // reportDropped writes one WARN event for the events dropped since the last report. Only the
@@ -221,11 +227,14 @@ func (g *GeneralLogger) reportDropped() {
 // seal stops Log from accepting events for this run. Log registers in run.inflight under the read
 // lock, so once seal has held the lock no new sender can appear, and closing releases the ones
 // still waiting for room.
-func (g *GeneralLogger) seal(run *loggerRun) {
+// It returns the children as they were when sealed; AddChild starts no child after that.
+func (g *GeneralLogger) seal(run *loggerRun) []logicologger.ParentLogger {
 	g.Lock()
 	g.stopped = true
+	children := g.children
 	g.Unlock()
 	run.close()
+	return children
 }
 
 func (g *GeneralLogger) handle(logEvent logicologger.LogEvent) {
@@ -261,49 +270,106 @@ func (g *GeneralLogger) write(msg logicologger.LogEvent) {
 	}
 }
 
-// Stop stops the children, stops accepting events, writes everything already queued, then closes
-// the writer. It waits at most the stop timeout for the queue to drain, and returns an error when
-// that runs out.
+// Stop stops accepting events, stops the children, writes everything already queued, then closes
+// the writer. The logger and its children share one stop timeout. When it runs out, Stop returns
+// an error wrapping ErrStopTimeout, the events still queued are dropped, and the writer is closed
+// later, once the writes in progress have returned.
 func (g *GeneralLogger) Stop() error {
+	return g.stopBy(time.Now().Add(g.stopTimeout))
+}
+
+func (g *GeneralLogger) stopBy(deadline time.Time) error {
 	g.RLock()
 	run := g.run
 	g.RUnlock()
 	if run == nil {
 		return nil
 	}
-	return g.stopRun(run)
-}
-
-func (g *GeneralLogger) stopRun(run *loggerRun) error {
 	run.stopOnce.Do(func() {
-		run.stopErr = g.shutdown(run)
+		run.stopErr = g.shutdown(run, deadline)
 	})
 	return run.stopErr
 }
 
-func (g *GeneralLogger) shutdown(run *loggerRun) error {
-	g.RLock()
-	children := g.children
-	g.RUnlock()
-	for _, child := range children {
-		child.Stop()
-	}
+func (g *GeneralLogger) shutdown(run *loggerRun, deadline time.Time) error {
+	children := g.seal(run)
+	childrenDone, childErr := stopChildren(children, deadline)
 
-	g.seal(run)
-	timer := time.NewTimer(g.stopTimeout)
+	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
 	var timeoutErr error
 	select {
 	case <-run.done:
 	case <-timer.C:
-		timeoutErr = fmt.Errorf("logicologger: stop timed out after %s before the queue was written", g.stopTimeout)
+		run.abandoned.Store(true)
+		timeoutErr = fmt.Errorf("%w after %s, queued events were dropped", ErrStopTimeout, g.stopTimeout)
 	}
 
-	var closeErr error
-	if writer := g.Writer(); writer != nil {
-		closeErr = writer.Close()
+	writersDone := append(childrenDone, run.done)
+	isEverythingWritten := timeoutErr == nil && childErr == nil
+	if !isEverythingWritten {
+		go g.closeWriterAfter(writersDone)
+		return errors.Join(childErr, timeoutErr)
 	}
-	return errors.Join(timeoutErr, closeErr)
+	return g.closeWriter()
+}
+
+// stopChildren stops every child at the same time against one deadline. It also returns the
+// done channels of the children's consumers, which write through this logger's writer.
+func stopChildren(children []logicologger.ParentLogger, deadline time.Time) ([]<-chan struct{}, error) {
+	if len(children) == 0 {
+		return nil, nil
+	}
+	errs := make([]error, len(children))
+	childrenDone := make([]<-chan struct{}, 0, len(children))
+	var wg sync.WaitGroup
+	for i, child := range children {
+		generalChild, isGeneral := child.(*GeneralLogger)
+		if !isGeneral {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				errs[i] = child.Stop()
+			}()
+			continue
+		}
+		if done := generalChild.consumerDone(); done != nil {
+			childrenDone = append(childrenDone, done)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = generalChild.stopBy(deadline)
+		}()
+	}
+	wg.Wait()
+	return childrenDone, errors.Join(errs...)
+}
+
+func (g *GeneralLogger) consumerDone() <-chan struct{} {
+	g.RLock()
+	defer g.RUnlock()
+	if g.run == nil {
+		return nil
+	}
+	return g.run.done
+}
+
+func (g *GeneralLogger) closeWriter() error {
+	writer := g.Writer()
+	if writer == nil {
+		return nil
+	}
+	return writer.Close()
+}
+
+func (g *GeneralLogger) closeWriterAfter(writersDone []<-chan struct{}) {
+	for _, done := range writersDone {
+		<-done
+	}
+	if err := g.closeWriter(); err != nil {
+		fmt.Fprintf(os.Stderr, "logicologger: close failed: %v\n", err)
+	}
 }
 
 // Flush returns once every event logged before the call has been written, or when ctx is done.
@@ -518,9 +584,12 @@ func WithWriter(w ...io.WriteCloser) GeneralLoggerOption {
 }
 
 // WithStopTimeout sets how long Stop waits for queued events to be written. The default is
-// DefaultStopTimeout.
+// DefaultStopTimeout, which is also used for d <= 0.
 func WithStopTimeout(d time.Duration) GeneralLoggerOption {
 	return func(logger *GeneralLogger) {
+		if d <= 0 {
+			d = DefaultStopTimeout
+		}
 		logger.stopTimeout = d
 	}
 }

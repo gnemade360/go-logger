@@ -37,7 +37,10 @@ func (g *GeneralWriter) Write(p []byte) (n int, err error) {
 	return len(p), multiErr.ErrorOrNil()
 }
 
+// Close waits for a Write in progress, then closes every target.
 func (g *GeneralWriter) Close() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	var mu sync.RWMutex
 	multiErr := &multi_error.MultiError{
 		RWMutex: &mu,

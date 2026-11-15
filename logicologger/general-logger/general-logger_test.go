@@ -668,3 +668,150 @@ func TestGeneralLogger_StopReleasesBlockedLoggers(t *testing.T) {
 		t.Fatal("Log still blocked after Stop")
 	}
 }
+
+type closeGuardWriter struct {
+	delay            time.Duration
+	inWrite          atomic.Bool
+	closed           atomic.Bool
+	closeDuringWrite atomic.Bool
+	writeAfterClose  atomic.Bool
+}
+
+func (w *closeGuardWriter) Write(p []byte) (int, error) {
+	if w.closed.Load() {
+		w.writeAfterClose.Store(true)
+	}
+	w.inWrite.Store(true)
+	time.Sleep(w.delay)
+	w.inWrite.Store(false)
+	return len(p), nil
+}
+
+func (w *closeGuardWriter) Close() error {
+	if w.inWrite.Load() {
+		w.closeDuringWrite.Store(true)
+	}
+	w.closed.Store(true)
+	return nil
+}
+
+func TestGeneralLogger_StopTimeoutNeverClosesUnderAWrite(t *testing.T) {
+	w := &closeGuardWriter{delay: 30 * time.Millisecond}
+	logger := general_logger.NewGeneralLogger(context.Background(), "guard", nil,
+		general_logger.WithWriter(w), general_logger.WithFormatter(messageFormatter{}),
+		general_logger.WithStopTimeout(10*time.Millisecond))
+
+	logger.Info("a")
+	logger.Info("b")
+	logger.Info("c")
+	err := logger.Stop()
+	deadline := time.Now().Add(time.Second)
+	for !w.closed.Load() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if err == nil {
+		t.Error("Stop() error got = nil, want a timeout error")
+	}
+	if !w.closed.Load() {
+		t.Error("writer never closed after the hung write returned")
+	}
+	if w.closeDuringWrite.Load() {
+		t.Error("writer closed while a write was running")
+	}
+	if w.writeAfterClose.Load() {
+		t.Error("writer written after it was closed")
+	}
+}
+
+func TestGeneralLogger_StopReportsAChildThatTimedOut(t *testing.T) {
+	w := newGateWriter()
+	t.Cleanup(func() { close(w.release) })
+	logger := newGatedLogger(t, w, general_logger.WithStopTimeout(30*time.Millisecond))
+	child := logger.AddChild(nil, "child", "", nil)
+
+	child.Info("c1")
+	waitEntered(t, w)
+	child.Info("c2")
+	err := logger.Stop()
+
+	if err == nil {
+		t.Error("Stop() error got = nil, want the child's timeout error")
+	}
+}
+
+func TestGeneralLogger_StopWaitsOneTimeoutForAllChildren(t *testing.T) {
+	const timeout = 100 * time.Millisecond
+	w := newGateWriter()
+	t.Cleanup(func() { close(w.release) })
+	logger := newGatedLogger(t, w, general_logger.WithStopTimeout(timeout))
+	for _, name := range []string{"a", "b", "c"} {
+		logger.AddChild(nil, name, "", nil).Info(name)
+	}
+	waitEntered(t, w)
+
+	started := time.Now()
+	logger.Stop()
+	elapsed := time.Since(started)
+
+	if elapsed > 2*timeout {
+		t.Errorf("Stop() took %v, want about %v", elapsed, timeout)
+	}
+}
+
+func TestGeneralLogger_AddChildAfterStopDoesNotWrite(t *testing.T) {
+	w := newCloseRecorder(0)
+	logger := newRecordedLogger(t, context.Background(), w)
+	logger.Stop()
+
+	child := logger.AddChild(nil, "late", "", nil)
+	child.Info("after stop")
+	time.Sleep(50 * time.Millisecond)
+
+	if got := w.written.Load(); got != 0 {
+		t.Errorf("events written after Stop got = %d, want 0", got)
+	}
+}
+
+func TestGeneralLogger_StartAfterStopReturnsErrStopped(t *testing.T) {
+	logger := newRecordedLogger(t, context.Background(), newCloseRecorder(0))
+	logger.Stop()
+
+	err := logger.Start(context.Background())
+
+	if !errors.Is(err, general_logger.ErrStopped) {
+		t.Errorf("Start() error got = %v, want %v", err, general_logger.ErrStopped)
+	}
+}
+
+func TestGeneralLogger_StopTimeoutErrorIsErrStopTimeout(t *testing.T) {
+	w := newGateWriter()
+	t.Cleanup(func() { close(w.release) })
+	logger := newGatedLogger(t, w, general_logger.WithStopTimeout(20*time.Millisecond))
+
+	logger.Info("hangs")
+	waitEntered(t, w)
+	err := logger.Stop()
+
+	if !errors.Is(err, general_logger.ErrStopTimeout) {
+		t.Errorf("Stop() error got = %v, want %v", err, general_logger.ErrStopTimeout)
+	}
+}
+
+func TestGeneralLogger_ZeroStopTimeoutUsesTheDefault(t *testing.T) {
+	const total = 100
+	w := newCloseRecorder(0)
+	logger := newRecordedLogger(t, context.Background(), w, general_logger.WithStopTimeout(0))
+
+	for i := range total {
+		logger.Info(strconv.Itoa(i))
+	}
+	err := logger.Stop()
+
+	if err != nil {
+		t.Errorf("Stop() error = %v", err)
+	}
+	if got := w.atClose.Load(); got != total {
+		t.Errorf("events written before Close got = %d, want %d", got, total)
+	}
+}
